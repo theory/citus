@@ -56,10 +56,31 @@
 
 #include "catalog/pg_proc.h"
 #include "optimizer/planmain.h"
+#include "utils/ruleutils.h"
+#include "optimizer/clauses.h"
 
+
+typedef struct ExpressionWalkerState
+{
+	bool isTopLevel; /* if there are no vars the entire expression can be evaluated */
+	bool containsVar; /* the callee sets this to signal to the parent it has a Var */
+	bool parentIsBranch; /* the caller sets this to signal to the children they should
+							also set the below variables */
+	List *subtreesWithVar; /* when parentIsBranch add yourself to one of these */
+	List *subtreesWithoutVar;
+	List *subtreeWeaving; /* A list of ints representing in which order the broken out
+							 lists should be reassembled */
+} ExpressionWalkerState;
+
+static void InitializeWalkerState(ExpressionWalkerState *state);
+static List * RewriteArgs(ExpressionWalkerState *state);
+static Node * EvaluateExpression(Node *expression);
 
 /* planner functions forward declarations */
 static void EvaluateTargetLists(Query *queryTree);
+static Node * PartiallyEvaluateExpression(Node *expression);
+static Node * PartiallyEvaluateExpressionWalker(Node *expression,
+												ExpressionWalkerState *state);
 static void ErrorIfModifyQueryNotSupported(Query *queryTree);
 static bool ContainsDisallowedFunctionCalls(Node *expression);
 static bool ContainsDisallowedFunctionCallsWalker(Node *expression, bool *containsVar);
@@ -143,8 +164,193 @@ MultiRouterPlanCreate(Query *query)
  * - if this node is a var, signal the parent
  * - if this node has a var, signal the parent
  */
-static void EvaluateQueryLists(Query *queryTree)
+static void EvaluateTargetLists(Query *queryTree)
 {
+	CmdType commandType = queryTree->commandType;
+	ListCell *targetEntryCell = NULL;
+	Node *modifiedNode = NULL;
+
+	Oid relid = ((RangeTblEntry *) linitial(queryTree->rtable))->relid;
+	List *deparseContext = deparse_context_for("table", relid);
+
+	// TODO: Is DELETE important too?
+	if (!(commandType == CMD_INSERT) && !(commandType == CMD_UPDATE))
+	{
+		return;
+	}
+
+	foreach(targetEntryCell, queryTree->targetList)
+	{
+		char *deparsedOrig = NULL;
+		char *deparsedModified = NULL;
+		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
+		Node *originalCopy = (Node *) copyObject(targetEntry->expr);
+		Node *modifiedCopy = NULL;
+
+		deparsedOrig = deparse_expression(originalCopy, deparseContext, false, true);
+		elog(WARNING, "target: %s", deparsedOrig);
+
+		modifiedNode = PartiallyEvaluateExpression((Node *) targetEntry->expr);
+
+		targetEntry->expr = (Expr *) modifiedNode;
+		modifiedCopy = (Node *) copyObject(targetEntry->expr);
+
+		deparsedModified = deparse_expression(modifiedCopy, deparseContext, false, false);
+		elog(WARNING, "after : %s", deparsedModified);
+	}
+}
+
+
+static Node * PartiallyEvaluateExpression(Node *expression)
+{
+	ExpressionWalkerState unused;
+	InitializeWalkerState(&unused);
+	unused.isTopLevel = true;
+	return PartiallyEvaluateExpressionWalker(expression, &unused);
+}
+
+
+static Node * PartiallyEvaluateExpressionWalker(Node *expression,
+		ExpressionWalkerState *state)
+{
+	// TODO: If we don't recognize the node, do the copy and pass through the state?
+	ExpressionWalkerState childState;
+	Node *copy = NULL;
+	bool isVar = false;
+	bool isBranch = false;
+
+	if (expression == NULL)
+	{
+		return expression;
+	}
+
+	if (IsA(expression, List))
+	{
+		return expression_tree_mutator(expression,
+									   PartiallyEvaluateExpressionWalker,
+									   state);
+	}
+
+	InitializeWalkerState(&childState);
+
+	if (IsA(expression, Var))
+	{
+		isVar = true;
+	}
+
+	if (IsA(expression, FuncExpr) || IsA(expression, OpExpr))
+	{
+		/* Tell the next step that it should add itself to one of the subtree lists */
+		childState.parentIsBranch = true;
+		isBranch = true;
+	}
+
+	copy = expression_tree_mutator(expression,
+								   PartiallyEvaluateExpressionWalker,
+								   &childState);
+
+	if (state->parentIsBranch)
+	{
+		if (childState.containsVar || isVar)
+		{
+			state->subtreesWithVar = lappend(state->subtreesWithVar, copy);
+			state->subtreeWeaving = lappend_int(state->subtreeWeaving, 0);
+		}
+		else
+		{
+			state->subtreesWithoutVar = lappend(state->subtreesWithoutVar, copy);
+			state->subtreeWeaving = lappend_int(state->subtreeWeaving, 1);
+		}
+	}
+
+	if (childState.containsVar || isVar)
+	{
+		state->containsVar = true;
+	}
+
+	// why are we checking for state->subtreesWithVar instead of state->containsVar?
+	if (isBranch && state->isTopLevel && list_length(childState.subtreesWithVar) == 0)
+	{
+		return EvaluateExpression(expression);
+	}
+
+	if ((list_length(childState.subtreesWithVar) != 0) &&
+		(list_length(childState.subtreesWithoutVar) != 0))
+	{
+		if (IsA(expression, FuncExpr))
+		{
+			((FuncExpr *) copy)->args = RewriteArgs(&childState);
+		}
+
+		if (IsA(expression, OpExpr))
+		{
+			((OpExpr *) copy)->args = RewriteArgs(&childState);
+		}
+	}
+
+	return copy;
+}
+
+static List * RewriteArgs(ExpressionWalkerState *state)
+{
+	/* Replace every non-subtree arg with the evaluated version of itself */
+	List *rewrittenArgs = NULL;
+	ListCell *nextArgCell = NULL;
+	int nextArg = 0;
+
+	foreach(nextArgCell, state->subtreeWeaving)
+	{
+		nextArg = lfirst_int(nextArgCell);
+		if (nextArg)
+		{
+			Node *original = (Node *)linitial(state->subtreesWithoutVar);
+			Node *evaluated = EvaluateExpression(original);
+			rewrittenArgs = lappend(rewrittenArgs, evaluated);
+			state->subtreesWithoutVar =
+				list_delete_first(state->subtreesWithoutVar);
+		}
+		else
+		{
+			rewrittenArgs = lappend(rewrittenArgs,
+									linitial(state->subtreesWithVar));
+			state->subtreesWithVar = list_delete_first(state->subtreesWithVar);
+		}
+	}
+
+	return rewrittenArgs;
+}
+
+static Node * EvaluateExpression(Node *expression)
+{
+	if(IsA(expression, FuncExpr))
+	{
+		FuncExpr *expr = (FuncExpr *)expression;
+
+		return (Node *) evaluate_expr((Expr *) expr,
+									  expr->funcresulttype,
+									  exprTypmod((Node *) expr),
+									  expr->funccollid);
+	}
+
+	if(IsA(expression, OpExpr))
+	{
+		OpExpr *expr = (OpExpr *)expression;
+
+		return (Node *) evaluate_expr((Expr *) expr,
+									  expr->opresulttype,
+									  exprTypmod((Node *) expr),
+									  expr->opcollid);
+	}
+}
+
+static void InitializeWalkerState(ExpressionWalkerState *state)
+{
+	state->isTopLevel = false;
+	state->containsVar = false;
+	state->parentIsBranch = false;
+	state->subtreesWithVar = NULL;
+	state->subtreesWithoutVar = NULL;
+	state->subtreeWeaving = NULL;
 }
 
 
@@ -300,10 +506,10 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 				continue;
 			}
 
-			if (contain_volatile_functions((Node *) targetEntry->expr))
+			if (commandType == CMD_UPDATE &&
+			    contain_volatile_functions((Node *) targetEntry->expr))
 			{
 				hasNonConstTargetEntryExprs = true;
-				break;
 			}
 
 			if (commandType == CMD_UPDATE &&
@@ -312,13 +518,13 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 				specifiesPartitionValue = true;
 			}
 
-			if (commandType == CMD_UPDATE &&
-				ContainsDisallowedFunctionCalls((Node *) targetEntry->expr))
-			{
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								errmsg("functions used in UPDATES cannot be VOLATILE and"
-									   " must not be called with column references")));
-			}
+//			if (commandType == CMD_UPDATE &&
+//				ContainsDisallowedFunctionCalls((Node *) targetEntry->expr))
+//			{
+//				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+//								errmsg("functions used in UPDATES cannot be VOLATILE and"
+//									   " must not be called with column references")));
+//			}
 		}
 
 		joinTree = queryTree->jointree;
@@ -411,7 +617,6 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 static bool ContainsDisallowedFunctionCalls(Node *expression)
 {
 	bool unused = false;
-	elog(WARNING, "being called");
 	return ContainsDisallowedFunctionCallsWalker(expression, &unused);
 }
 
