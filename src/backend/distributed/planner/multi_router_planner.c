@@ -54,9 +54,15 @@
 #include "utils/relcache.h"
 #include "utils/typcache.h"
 
+#include "catalog/pg_proc.h"
+#include "optimizer/planmain.h"
+
 
 /* planner functions forward declarations */
+static void EvaluateTargetLists(Query *queryTree);
 static void ErrorIfModifyQueryNotSupported(Query *queryTree);
+static bool ContainsDisallowedFunctionCalls(Node *expression);
+static bool ContainsDisallowedFunctionCallsWalker(Node *expression, bool *containsVar);
 static Task * RouterModifyTask(Query *query);
 #if (PG_VERSION_NUM >= 90500)
 static OnConflictExpr * RebuildOnConflict(Oid relationId,
@@ -99,6 +105,7 @@ MultiRouterPlanCreate(Query *query)
 	if (modifyTask)
 	{
 		ErrorIfModifyQueryNotSupported(query);
+		EvaluateTargetLists(query);
 		task = RouterModifyTask(query);
 	}
 	else
@@ -117,6 +124,27 @@ MultiRouterPlanCreate(Query *query)
 	multiPlan->masterTableName = NULL;
 
 	return multiPlan;
+}
+
+
+/*
+ * Walks the query looking for and evaluating expressions which don't contain Vars.
+ *
+ * If you have a var your entire part of the tree cannot be evaluated.
+ * So, nothing can be evaluated until we hit a leaf.
+ * However, it would be very wasteful to evaluate at every step. If there are no Vars
+ * we would prefer to only walk the tree once and do a single evaluation at the end.
+ *
+ * When evaluating a tree:
+ * - if this is a node where some children have vars and some don't, evaluate the ones
+ *   without
+ * - if this is a node and there are no Vars, continue going up.
+ * - if this is the top of the tree and there are no Vars evaluate the whole thing
+ * - if this node is a var, signal the parent
+ * - if this node has a var, signal the parent
+ */
+static void EvaluateQueryLists(Query *queryTree)
+{
 }
 
 
@@ -272,15 +300,24 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 				continue;
 			}
 
-			if (contain_mutable_functions((Node *) targetEntry->expr))
+			if (contain_volatile_functions((Node *) targetEntry->expr))
 			{
 				hasNonConstTargetEntryExprs = true;
+				break;
 			}
 
 			if (commandType == CMD_UPDATE &&
 				targetEntry->resno == partitionColumn->varattno)
 			{
 				specifiesPartitionValue = true;
+			}
+
+			if (commandType == CMD_UPDATE &&
+				ContainsDisallowedFunctionCalls((Node *) targetEntry->expr))
+			{
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("functions used in UPDATES cannot be VOLATILE and"
+									   " must not be called with column references")));
 			}
 		}
 
@@ -363,6 +400,88 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("modifying the partition value of rows is not allowed")));
 	}
+}
+
+
+/*
+ * This expression may not contain VOLATILE functions.
+ * If may contain STABLE functions, but only if none of their parameters are derived from
+ * a Var.
+ */
+static bool ContainsDisallowedFunctionCalls(Node *expression)
+{
+	bool unused = false;
+	elog(WARNING, "being called");
+	return ContainsDisallowedFunctionCallsWalker(expression, &unused);
+}
+
+
+/*
+ * Almost everything is allowed, except for
+ *
+ * Top -> StableFunc -> Var
+ *
+ * or an indirect
+ *
+ * Top -> StableFunc -> ImmutableFunc -> Var
+ *
+ * If we see a Var we signal to our caller by setting containsVar which then gets
+ * propogated up. Throw an error if we're a StableFunc and our child set containsVar
+ */
+static bool ContainsDisallowedFunctionCallsWalker(Node *expression, bool *containsVar)
+{
+	char volatileFlag = 0;
+	bool childContainsVar = false;
+	bool containsDisallowedFunction = false;
+
+	if (expression == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(expression, Var))
+	{
+		*containsVar = true;
+		return false;
+	}
+
+	if (IsA(expression, OpExpr))
+	{
+		OpExpr *expr = (OpExpr *) expression;
+
+		set_opfuncid(expr);
+		volatileFlag = func_volatile(expr->opfuncid);
+	}
+
+	if (IsA(expression, FuncExpr))
+	{
+		FuncExpr *expr = (FuncExpr *) expression;
+
+		volatileFlag = func_volatile(expr->funcid);
+	}
+
+	// TODO: DistinctExpr, NullIfExpr, ScalarArrayOpExpr, CoerceViaIO, ArrayCoerceExpr,
+	// RowCompareExpr (all from contain_mutable_functions_walker)
+
+	if (volatileFlag == PROVOLATILE_VOLATILE)
+	{
+		/* the caller should have already checked for this? */
+		Assert(false);
+	}
+	else if (volatileFlag == PROVOLATILE_STABLE)
+	{
+		containsDisallowedFunction =
+			expression_tree_walker(expression,
+								   ContainsDisallowedFunctionCallsWalker,
+								   &childContainsVar);
+
+		return (containsDisallowedFunction || childContainsVar);
+	}
+
+	/* keep traversing */
+	return expression_tree_walker(expression,
+								  ContainsDisallowedFunctionCallsWalker,
+								  containsVar);
 }
 
 
